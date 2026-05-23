@@ -1,14 +1,17 @@
 from __future__ import annotations
 import asyncio
+import json
 import logging
 import uuid
+from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.pipeline import run_pipeline
-from app.state import new_run, get_run
+from app.state import new_run, get_run, snapshot, subscribe, unsubscribe
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -39,23 +42,48 @@ async def read_run(run_id: str) -> dict:
     state = get_run(run_id)
     if not state:
         raise HTTPException(status_code=404, detail="run not found")
-    return {
-        "run_id": state.run_id,
-        "product": state.product,
-        "step": state.step,
-        "error": state.error,
-        "icp": state.icp.model_dump() if state.icp else None,
-        "prospects": [
-            {
-                "candidate": p.candidate.model_dump(),
-                "dossier": p.dossier.model_dump() if p.dossier else None,
-                "brief": p.brief.model_dump() if p.brief else None,
-                "senso_category_id": p.senso_category_id,
-                "error": p.error,
-            }
-            for p in state.prospects
-        ],
-    }
+    return snapshot(state)
+
+
+@app.get("/runs/{run_id}/events")
+async def stream_events(run_id: str) -> StreamingResponse:
+    state = get_run(run_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="run not found")
+
+    async def gen() -> AsyncIterator[bytes]:
+        # Replay historical events first so a late subscriber catches up.
+        yield _sse({"type": "state", "data": snapshot(state)})
+        for ev in list(state.event_log):
+            yield _sse(ev)
+
+        q = subscribe(state)
+        try:
+            while True:
+                try:
+                    ev = await asyncio.wait_for(q.get(), timeout=15.0)
+                    yield _sse(ev)
+                except asyncio.TimeoutError:
+                    # keepalive comment — defeats proxy idle timeouts
+                    yield b": keepalive\n\n"
+        except asyncio.CancelledError:
+            raise
+        finally:
+            unsubscribe(state, q)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+def _sse(payload: dict) -> bytes:
+    return f"data: {json.dumps(payload)}\n\n".encode("utf-8")
 
 
 @app.get("/healthz")

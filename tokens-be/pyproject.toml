@@ -10,5 +10,6 @@ dependencies = [
     "openai-agents>=0.17.3",
     "pydantic>=2.13.4",
     "python-dotenv>=1.2.2",
+    "senso-developers>=0.0.1a2",
     "uvicorn[standard]>=0.47.0",
 ]
